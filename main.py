@@ -123,9 +123,59 @@ def build_notification(success, url, server_name, old_expire, new_expire=None, f
     lines.append("Host2Play Auto Renew")
     return "\n".join(lines)
 
-def capture_page_screenshot(page, file_name):
+def get_current_ip():
     try:
+        return requests.get("https://api.ipify.org", timeout=10).text
+    except Exception:
+        return "未知"
+
+def capture_page_screenshot(page, file_name, extra_info=""):
+    try:
+        if page is None:
+            log("页面为空，无法截图", "WARN")
+            return None
+        
+        # 注入信息覆盖层
+        current_ip = get_current_ip()
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        overlay_html = f'''
+        <div id="info-overlay" style="
+            position: fixed;
+            top: 10px;
+            left: 10px;
+            background: rgba(0,0,0,0.85);
+            color: #00ff00;
+            padding: 15px;
+            border-radius: 8px;
+            font-family: monospace;
+            font-size: 14px;
+            z-index: 999999;
+            border: 2px solid #00ff00;
+            max-width: 400px;
+        ">
+            <div style="color: #ffcc00; font-weight: bold; margin-bottom: 8px;">[DEBUG INFO]</div>
+            <div>IP: {current_ip}</div>
+            <div>时间: {timestamp}</div>
+            {f'<div style="color: #ff6666;">{extra_info}</div>' if extra_info else ''}
+        </div>
+        '''
+        
+        page.run_js(f'''
+            // 移除旧的覆盖层
+            const old = document.getElementById('info-overlay');
+            if (old) old.remove();
+            // 添加新的覆盖层
+            document.body.insertAdjacentHTML('beforeend', `{overlay_html}`);
+        ''')
+        
+        time.sleep(0.5)  # 等待渲染
         page.get_screenshot(path=file_name)
+        
+        # 移除覆盖层
+        page.run_js('const el = document.getElementById("info-overlay"); if(el) el.remove();')
+        
+        log(f"截图已保存: {file_name} (IP: {current_ip})")
         return file_name
     except Exception as e:
         log(f"截图失败: {e}", "WARN")
@@ -136,11 +186,23 @@ def capture_page_screenshot(page, file_name):
 # ==============================================================================
 def restart_warp():
     log("正在重启 WARP 以更换 IP...")
+    screenshot_dir = "output/screenshots"
+    os.makedirs(screenshot_dir, exist_ok=True)
+    
     try:
         old_ip = requests.get("https://api.ipify.org", timeout=10).text
         log(f"当前 IP: {old_ip}")
     except Exception:
         old_ip = "未知"
+    
+    # 截图记录更换前状态
+    try:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        capture_page_screenshot(None, os.path.join(screenshot_dir, f"warp-before-{ts}.png"), 
+                               f"WARP 重连前 IP: {old_ip}")
+    except:
+        pass
+    
     try:
         subprocess.run(["sudo", "warp-cli", "--accept-tos", "disconnect"],
                       check=False, timeout=30, capture_output=True)
@@ -157,7 +219,7 @@ def restart_warp():
                       check=True, timeout=30, capture_output=True)
         time.sleep(10)
         new_ip = requests.get("https://api.ipify.org", timeout=10).text
-        log(f"WARP 重连成功，新 IP: {new_ip}")
+        log(f"WARP 重连成功，新 IP: {old_ip} -> {new_ip}")
         return True
     except Exception as e:
         log(f"WARP 重连失败: {e}", "ERROR")
@@ -202,14 +264,28 @@ def is_blocked(page):
     if not bframe:
         return False
     try:
-        return bool(bframe.run_js("""
+        result = bframe.run_js("""
             const h = document.querySelector('.rc-doscaptcha-header-text');
-            if (h && h.textContent.toLowerCase().includes('try again later')) return true;
+            const hText = h ? h.textContent : '';
+            const isTryAgain = hText.toLowerCase().includes('try again later');
+            
             const e = document.querySelector('.rc-audiochallenge-error-message');
-            if (e && e.offsetParent !== null) return true;
-            return false;
-        """))
-    except Exception:
+            const isVisible = e && e.offsetParent !== null;
+            
+            return {
+                headerText: hText,
+                isTryAgain: isTryAgain,
+                errorVisible: isVisible,
+                blocked: isTryAgain || isVisible
+            };
+        """)
+        
+        if result.get('blocked'):
+            log(f"[BLOCKED DETECTED] header: '{result.get('headerText')}', errorVisible: {result.get('errorVisible')}", "WARN")
+        
+        return result.get('blocked', False)
+    except Exception as e:
+        log(f"检查封锁状态异常: {e}", "WARN")
         return False
 
 def click_recaptcha_checkbox(page):
@@ -647,7 +723,14 @@ def renew_single_url(url):
             finally:
                 if page:
                     screen_name = f"host2play-{server_name}-{'success' if success else 'fail'}.png"
-                    screenshot_path = capture_page_screenshot(page, os.path.join(screenshot_dir, screen_name))
+                    extra_info = f"状态: {'成功' if success else '失败'}"
+                    if failure_reason:
+                        extra_info += f" | 原因: {failure_reason}"
+                    screenshot_path = capture_page_screenshot(
+                        page, 
+                        os.path.join(screenshot_dir, screen_name),
+                        extra_info
+                    )
                     try:
                         page.quit()
                     except:
